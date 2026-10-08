@@ -1,0 +1,12 @@
+// Tile (optional, needs capacity overview events): Rebuilt numbers against Fabric's own, last 24 hours
+// Visual: Table.
+CapacityFabricCheck(1d)
+| project
+    Capacity = capacity_label,
+    ['Minutes compared'] = minutes_compared,
+    ['Avg utilization %'] = avg_utilization_pct,
+    ['Fabric avg utilization %'] = avg_fabric_utilization_pct,
+    ['Mean diff, utilization'] = mean_abs_diff_utilization,
+    ['95th pct diff, utilization'] = p95_abs_diff_utilization,
+    ['Mean diff, 10-min measure'] = mean_abs_diff_delay,
+    ['Same stage %'] = stage_agreement_pct

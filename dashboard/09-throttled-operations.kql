@@ -1,0 +1,15 @@
+// Tile: Rejected and delayed operations, last 24 hours
+// Visual: Table.
+CapacityThrottledOps(24)
+| where capacity_label == _capacity
+| project
+    Workspace = workspace_name,
+    Item = item_name,
+    Operation = operation_name,
+    Type = utilization_type,
+    Rejected = rejected_ops,
+    Delayed = delayed_ops,
+    ['Delay s'] = total_delay_s,
+    Users = users,
+    First = first_local,
+    Last = last_local

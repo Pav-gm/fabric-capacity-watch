@@ -1,0 +1,222 @@
+.execute database script <|
+// =============================================================================
+// Capacity Watch: tables, ingestion mapping, update policies and data policies
+//
+// Run this in the KQL database BEFORE you connect the Eventstream destination.
+// It is safe to run again: nothing is dropped and no data is lost.
+//
+// How data flows:
+//   Eventstream  ->  CapacityEventsRaw  (one row per event, exactly as Fabric sends it)
+//                       |  update policies split the events by type
+//                       +->  CapacityOperations    capacity operation events (required)
+//                       +->  CapacitySummary       capacity overview events, every 30 s (optional)
+//                       +->  CapacityStateChanges  capacity overview events, on state change (optional)
+//
+// The raw table's columns have the same names as the top-level fields of the
+// events, so the Eventstream "Get data" wizard maps them correctly when you
+// pick this existing table.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// Landing table. Keep it short-lived: the typed tables below hold the history.
+// -----------------------------------------------------------------------------
+.create-merge table CapacityEventsRaw (
+    specversion: string,
+    ['type']: string,                 // event type, e.g. Microsoft.Fabric.CapacityOperationEvents.Operation
+    source: string,                   // tenant ID
+    subject: string,                  // /capacities/<id>/workspaces/<id>/items/<id>
+    id: string,                       // unique per event, used to drop duplicates
+    ['time']: datetime,               // when Fabric emitted the event
+    dataschemaversion: string,
+    data: dynamic                     // the event payload
+) with (folder = "CapacityWatch", docstring = "Fabric capacity events as received from the Eventstream (landing table)")
+
+// For the Eventstream REST API (Direct ingestion needs a mapping name). The
+// "Get data" wizard builds an equivalent mapping by itself.
+.create-or-alter table CapacityEventsRaw ingestion json mapping "CapacityEventsRaw_mapping"
+'['
+'{"column":"specversion","path":"$.specversion","datatype":"string"},'
+'{"column":"type","path":"$.type","datatype":"string"},'
+'{"column":"source","path":"$.source","datatype":"string"},'
+'{"column":"subject","path":"$.subject","datatype":"string"},'
+'{"column":"id","path":"$.id","datatype":"string"},'
+'{"column":"time","path":"$.time","datatype":"datetime"},'
+'{"column":"dataschemaversion","path":"$.dataschemaversion","datatype":"string"},'
+'{"column":"data","path":"$.data","datatype":"dynamic"}'
+']'
+
+.alter-merge table CapacityEventsRaw policy retention softdelete = 3d recoverability = disabled
+
+// -----------------------------------------------------------------------------
+// Capacity operation events: one row per operation that used capacity.
+// -----------------------------------------------------------------------------
+.create-merge table CapacityOperations (
+    event_time: datetime,             // when Fabric emitted the event
+    event_id: string,                 // unique per event (duplicates are dropped at query time)
+    event_type: string,
+    capacity_id: string,
+    capacity_name: string,
+    capacity_friendly_name: string,
+    capacity_sku: string,             // SKU at the time of the operation, e.g. F64
+    activation_id: string,            // changes when the capacity is paused and resumed
+    workspace_id: string,
+    workspace_name: string,
+    item_id: string,
+    item_name: string,
+    item_kind: string,
+    operation_id: string,
+    operation_name: string,
+    status: string,                   // e.g. Success, Failure, Cancelled, Rejected
+    utilization_type: string,         // Interactive or Background
+    release_type: string,             // Public = billable, Preview = not billable
+    capacity_unit_ms: real,           // CU milliseconds
+    duration_ms: long,
+    throttling_delay_ms: long,
+    operation_start_time: datetime,
+    consumption_start_time: datetime,
+    window_start_time: datetime,      // smoothing window Fabric applied
+    window_end_time: datetime,
+    identity_type: string,
+    identity_value: string,           // user or service principal: treat as personal data
+    data: dynamic                     // the full payload, in case you need a field later
+) with (folder = "CapacityWatch", docstring = "Fabric capacity operation events, one row per event")
+
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Update policy: capacity operation events from the landing table")
+CapacityOperationsFromRaw() {
+    CapacityEventsRaw
+    | where ['type'] == "Microsoft.Fabric.CapacityOperationEvents.Operation"
+    | project
+        event_time = ['time'],
+        event_id = id,
+        event_type = ['type'],
+        capacity_id = tostring(data.capacityId),
+        capacity_name = tostring(data.capacityName),
+        capacity_friendly_name = tostring(data.capacityFriendlyName),
+        capacity_sku = tostring(data.capacitySku),
+        activation_id = tostring(data.activationId),
+        workspace_id = tostring(data.workspaceId),
+        workspace_name = tostring(data.workspaceName),
+        item_id = tostring(data.itemId),
+        item_name = tostring(data.itemName),
+        item_kind = tostring(data.itemKind),
+        operation_id = tostring(data.operationId),
+        operation_name = tostring(data.operationName),
+        status = tostring(data.status),
+        utilization_type = tostring(data.utilizationType),
+        release_type = tostring(data.releaseType),
+        capacity_unit_ms = toreal(data.capacityUnitMs),
+        duration_ms = tolong(data.durationMs),
+        throttling_delay_ms = tolong(data.throttlingDelayMs),
+        operation_start_time = todatetime(data.operationStartTime),
+        consumption_start_time = todatetime(data.consumptionStartTime),
+        window_start_time = todatetime(data.windowStartTime),
+        window_end_time = todatetime(data.windowEndTime),
+        identity_type = tostring(data.identityType),
+        identity_value = tostring(data.identityValue),
+        data
+}
+
+.alter table CapacityOperations policy update
+@'[{"IsEnabled": true, "Source": "CapacityEventsRaw", "Query": "CapacityOperationsFromRaw()", "IsTransactional": false}]'
+
+// Keep 30 days. Change 30d to keep more or less history.
+.alter-merge table CapacityOperations policy retention softdelete = 30d recoverability = disabled
+.alter table CapacityOperations policy caching hot = 30d
+
+// -----------------------------------------------------------------------------
+// Optional: capacity overview events. Fabric's own smoothed numbers, every 30 s.
+// Used to check the rebuilt numbers (CapacityFabricCheck). Empty if you only
+// stream capacity operation events.
+// -----------------------------------------------------------------------------
+.create-merge table CapacitySummary (
+    event_time: datetime,
+    event_id: string,
+    capacity_id: string,
+    capacity_name: string,
+    capacity_sku: string,
+    capacity_region: string,
+    window_start_time: datetime,      // 30 second timepoint
+    window_end_time: datetime,
+    base_capacity_units: real,        // CU per second of the SKU
+    capacity_unit_ms: real,           // smoothed CU milliseconds in the timepoint (billable)
+    utilization_background_ms: real,
+    utilization_interactive_ms: real,
+    utilization_background_preview_ms: real,
+    utilization_interactive_preview_ms: real,
+    interactive_delay_pct: real,      // over 100: Fabric delays interactive work
+    interactive_rejection_pct: real,  // over 100: Fabric rejects interactive work
+    background_rejection_pct: real,   // over 100: Fabric rejects all work
+    overage_total_cu_ms: real,        // carry-forward into this timepoint
+    overage_add_cu_ms: real,
+    overage_burndown_cu_ms: real,
+    data: dynamic
+) with (folder = "CapacityWatch", docstring = "Fabric capacity overview Summary events (optional), one row per capacity per 30 seconds")
+
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Update policy: capacity Summary events from the landing table")
+CapacitySummaryFromRaw() {
+    CapacityEventsRaw
+    | where ['type'] == "Microsoft.Fabric.Capacity.Summary"
+    | project
+        event_time = ['time'],
+        event_id = id,
+        capacity_id = tostring(data.capacityId),
+        capacity_name = tostring(data.capacityName),
+        capacity_sku = tostring(data.capacitySku),
+        capacity_region = tostring(data.capacityRegion),
+        window_start_time = todatetime(data.windowStartTime),
+        window_end_time = todatetime(data.windowEndTime),
+        base_capacity_units = toreal(data.baseCapacityUnits),
+        capacity_unit_ms = toreal(data.capacityUnitMs),
+        utilization_background_ms = toreal(data.utilizationBackground),
+        utilization_interactive_ms = toreal(data.utilizationInteractive),
+        utilization_background_preview_ms = toreal(data.utilizationBackgroundPreview),
+        utilization_interactive_preview_ms = toreal(data.utilizationInteractivePreview),
+        interactive_delay_pct = toreal(data.interactiveDelayThresholdPercentage),
+        interactive_rejection_pct = toreal(data.interactiveRejectionThresholdPercentage),
+        background_rejection_pct = toreal(data.backgroundRejectionThresholdPercentage),
+        overage_total_cu_ms = toreal(data.overageTotalCapacityUnitMs),
+        overage_add_cu_ms = toreal(data.overageAddCapacityUnitMs),
+        overage_burndown_cu_ms = toreal(data.overageBurndownCapacityUnitMs),
+        data
+}
+
+.alter table CapacitySummary policy update
+@'[{"IsEnabled": true, "Source": "CapacityEventsRaw", "Query": "CapacitySummaryFromRaw()", "IsTransactional": false}]'
+
+.alter-merge table CapacitySummary policy retention softdelete = 30d recoverability = disabled
+.alter table CapacitySummary policy caching hot = 30d
+
+.create-merge table CapacityStateChanges (
+    event_time: datetime,
+    event_id: string,
+    capacity_id: string,
+    capacity_name: string,
+    capacity_sku: string,
+    transition_time: datetime,
+    capacity_state: string,           // e.g. Active, Overloaded, Paused
+    state_change_reason: string,      // e.g. NotOverloaded, InteractiveDelay, InteractiveRejected, AllRejected
+    activation_id: string,
+    data: dynamic
+) with (folder = "CapacityWatch", docstring = "Fabric capacity overview State events (optional): throttling, pause and resume")
+
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Update policy: capacity State events from the landing table")
+CapacityStateFromRaw() {
+    CapacityEventsRaw
+    | where ['type'] == "Microsoft.Fabric.Capacity.State"
+    | project
+        event_time = ['time'],
+        event_id = id,
+        capacity_id = tostring(data.capacityId),
+        capacity_name = tostring(data.capacityName),
+        capacity_sku = tostring(data.capacitySku),
+        transition_time = todatetime(data.transitionTime),
+        capacity_state = tostring(data.capacityState),
+        state_change_reason = tostring(data.stateChangeReason),
+        activation_id = tostring(data.activationId),
+        data
+}
+
+.alter table CapacityStateChanges policy update
+@'[{"IsEnabled": true, "Source": "CapacityEventsRaw", "Query": "CapacityStateFromRaw()", "IsTransactional": false}]'
+
+.alter-merge table CapacityStateChanges policy retention softdelete = 365d recoverability = disabled

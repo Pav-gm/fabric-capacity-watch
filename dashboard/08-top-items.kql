@@ -1,0 +1,17 @@
+// Tile: Top items, last 24 hours against the 24 hours before
+// Visual: Table.
+CapacityTopItems(24)
+| where capacity_label == _capacity
+| top 25 by cu_s desc
+| project
+    Workspace = workspace_name,
+    Item = item_name,
+    Kind = item_kind,
+    Operation = operation_name,
+    Type = utilization_type,
+    ['CU-s'] = cu_s,
+    ['CU-s before'] = prev_cu_s,
+    Change = change_cu_s,
+    ['Share of SKU %'] = share_of_sku_pct,
+    Operations = operations,
+    Rejected = rejected_ops

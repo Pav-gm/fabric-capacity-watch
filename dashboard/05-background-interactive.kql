@@ -1,0 +1,5 @@
+// Tile: Background and interactive load
+// Visual: Stacked area chart. X: ts. Y: Background, Interactive. One point per minute.
+CapacityMinute(24h)
+| where capacity_label == _capacity
+| project ts, Background = background_pct, Interactive = interactive_pct

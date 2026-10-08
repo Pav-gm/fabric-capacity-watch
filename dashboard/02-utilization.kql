@@ -1,0 +1,6 @@
+// Tile: Utilization, actual and already booked
+// Visual: Line chart. X: ts. Y: the three columns. Each point is the worst minute of its 5 minutes.
+// "Booked" is the smoothed usage of work that already ran and will keep landing if nothing new runs.
+CapacityTimeline(24h, 5m)
+| where capacity_label == _capacity
+| project ts, Actual = actual_pct, Booked = projected_pct, Limit = limit_pct

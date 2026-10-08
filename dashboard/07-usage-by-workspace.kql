@@ -1,0 +1,9 @@
+// Tile: Share of the SKU day by workspace, last 14 days
+// Visual: Stacked column chart. X: Day. Y: Share of SKU day %. Series: Workspace.
+// The ten biggest workspaces are shown, the rest are grouped as "Other".
+let usage = CapacityDailyUsage(14d) | where capacity_label == _capacity;
+let top_workspaces = usage | summarize total = sum(cu_s) by workspace_name | top 10 by total | project workspace_name;
+usage
+| extend Workspace = iff(workspace_name in (top_workspaces), workspace_name, "Other")
+| summarize ['Share of SKU day %'] = sum(share_of_sku_day_pct) by Day = day, Workspace
+| order by Day asc

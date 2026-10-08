@@ -1,0 +1,16 @@
+// Tile: Overage episodes, last 7 days
+// Visual: Table. One row per stretch above 100%, until the carry-forward was paid back.
+// Conditional formatting on Worst stage: "None" green, "Interactive delay" yellow, rejection stages red.
+CapacityOverageEpisodes(7d)
+| where capacity_label == _capacity
+| project
+    Start = start_local,
+    End = end_local,
+    Kind = episode_kind,
+    ['Worst stage'] = throttle_stage,
+    ['Minutes over 100%'] = over_100_min,
+    ['Episode min'] = episode_min,
+    ['Peak %'] = peak_pct,
+    ['Max carry-forward min'] = max_carry_min,
+    ['Rejected ops'] = rejected_ops,
+    Open = still_open

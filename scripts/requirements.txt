@@ -1,0 +1,4 @@
+# scripts/kql.py and scripts/check_access.py sign in with your Azure CLI login (az login)
+azure-identity>=1.15
+# tests/reference.py and tests/run_tests.py
+numpy>=1.24

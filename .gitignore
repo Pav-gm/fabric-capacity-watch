@@ -1,0 +1,15 @@
+# your setup decisions and IDs (see CLAUDE.md)
+setup-notes.md
+
+# a dashboard file downloaded from Fabric holds your workspace and database IDs;
+# remove this line in a private copy if you want to keep it in git
+dashboard/*.json
+
+# generated test data
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

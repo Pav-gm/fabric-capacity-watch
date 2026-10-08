@@ -1,0 +1,11 @@
+// Tile: Stream health
+// Visual: Table. Shows every event type, so it does not use the parameter.
+// Conditional formatting on Status: text starting with "Problem" red.
+CapacityWatchHealth()
+| project
+    ['Event type'] = event_type,
+    Status = status,
+    ['Rows last hour'] = raw_rows_last_hour,
+    ['Rows last day'] = raw_rows_last_day,
+    Capacities = capacities,
+    ['Minutes since newest'] = minutes_since_newest

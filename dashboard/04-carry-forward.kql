@@ -1,0 +1,5 @@
+// Tile: Carry-forward (minutes of full capacity owed)
+// Visual: Area chart. X: ts. Y: Carry-forward min.
+CapacityTimeline(24h, 5m)
+| where capacity_label == _capacity and ts <= now()
+| project ts, ['Carry-forward min'] = carry_min

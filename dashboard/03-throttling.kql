@@ -1,0 +1,10 @@
+// Tile: Throttling measures (Fabric throttles when one goes over 100%)
+// Visual: Line chart. X: ts. Y: the four columns. A logarithmic Y axis helps when one measure is far above the others.
+// Points after now show when each measure falls back under 100% if nothing new runs.
+CapacityTimeline(24h, 5m)
+| where capacity_label == _capacity
+| project ts,
+    ['Interactive delay (10 min)'] = delay_pct,
+    ['Interactive rejection (60 min)'] = interactive_reject_pct,
+    ['Background rejection (24 h)'] = background_reject_pct,
+    Limit = limit_pct

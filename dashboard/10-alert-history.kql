@@ -1,0 +1,5 @@
+// Tile: Alert level changes, last 24 hours
+// Visual: Table. Shows every capacity, so it does not use the parameter.
+// Conditional formatting on To: "critical" red, "warning" orange, "ok" green.
+CapacityAlertHistory(24)
+| project Time = as_of_local, Capacity = capacity_label, From = previous_level, To = alert_level, Reason = reason

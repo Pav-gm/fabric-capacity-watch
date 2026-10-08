@@ -1,0 +1,660 @@
+.execute database script <|
+// =============================================================================
+// Capacity Watch: stored functions
+//
+// Run after 01-tables.kql, in the same KQL database. Safe to run again.
+// The dashboard and the alert both read these functions, so they always agree.
+//
+// How the numbers are rebuilt from capacity operation events
+// (details in docs/00-how-fabric-measures-capacity.md):
+//   - Each operation's CU is spread ("smoothed") over a window: Fabric's own
+//     window from the event, or 24 hours for background and 5 minutes for
+//     interactive work (setting "smoothing").
+//   - Smoothed CU in use / SKU CU = utilization. Over 100% is not throttling yet.
+//   - Overage that is not paid back right away is carried forward.
+//   - Fabric throttles on three measures: the CU already booked for the next
+//     10 minutes, 60 minutes and 24 hours, plus the carry-forward, divided by
+//     what the SKU provides in that time. Over 100% on the 10 minute measure:
+//     interactive delay. On the 60 minute measure: interactive rejection. On
+//     the 24 hour measure: everything is rejected.
+//   - Only billable operations count (release_type Preview is not billable).
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Settings. Edit the values and run this command again to change them.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Capacity Watch settings")
+CapacityWatchSettings() {
+    dynamic({
+        "time_zone": "UTC",                     // for daily totals and local times, e.g. "America/New_York"
+        "smoothing": "window",                  // "window": the smoothing window Fabric puts on each event
+                                                // (falls back to "type" when an event has no usable window)
+                                                // "type": 24 h for background, 5 min for interactive work
+        "interactive_window_min": 5,
+        "background_window_min": 1440,
+        "eval_lag_min": 1,                      // ignore the newest minute, its events are still arriving
+        "warmup_days": 2,                       // history read before the requested range so carry-forward starts right
+        "delay_horizon_min": 10,                // Fabric throttling measures, in minutes
+        "interactive_reject_horizon_min": 60,
+        "background_reject_horizon_min": 1440,
+        "warning_over_streak_min": 10,          // alert: warning after this many minutes over 100% in a row (0 = off)
+        "rejection_lookback_min": 15,           // alert: any rejected operation in this many minutes is critical
+        "alert_window_min": 5                   // must match how often Activator runs CapacityAlertChanges()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// CU per second that a SKU provides. F SKUs carry the number in the name.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "CU per second for a capacity SKU name (F64 -> 64)")
+CapacitySkuCU(sku: string) {
+    case(
+        sku matches regex @"^F\d+$", toreal(substring(sku, 1)),
+        sku == "FT1", 64.0,                                   // trial capacity
+        sku == "P1", 64.0, sku == "P2", 128.0, sku == "P3", 256.0, sku == "P4", 512.0, sku == "P5", 1024.0,
+        sku == "EM1", 8.0, sku == "EM2", 16.0, sku == "EM3", 32.0,
+        real(null))
+}
+
+// ---------------------------------------------------------------------------
+// Clean operation rows: one row per event (duplicates dropped), CU in
+// CU-seconds, and the smoothing window each operation counts over.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Deduplicated operations with CU-seconds and smoothing window, reported between from_time and to_time")
+CapacityOps(from_time: datetime, to_time: datetime) {
+    let s = CapacityWatchSettings();
+    let ia_len = toint(s.interactive_window_min) * 1m;
+    let bg_len = toint(s.background_window_min) * 1m;
+    let use_window = tostring(s.smoothing) == "window";
+    CapacityOperations
+    | where event_time >= from_time and event_time < to_time
+    | where isnotempty(capacity_id)
+    | where isempty(event_type) or event_type == "Microsoft.Fabric.CapacityOperationEvents.Operation"
+    | extend dedup_key = iff(isnotempty(event_id), event_id,
+        strcat(operation_id, "|", tostring(event_time), "|", tostring(capacity_unit_ms)))
+    | summarize arg_max(event_time, capacity_id, capacity_name, capacity_friendly_name, capacity_sku, activation_id,
+        workspace_id, workspace_name, item_id, item_name, item_kind, operation_id, operation_name, status,
+        utilization_type, release_type, capacity_unit_ms, duration_ms, throttling_delay_ms,
+        operation_start_time, window_start_time, window_end_time, identity_type, identity_value) by dedup_key
+    | extend
+        ts = event_time,
+        cu_s = coalesce(capacity_unit_ms, 0.0) / 1000.0,
+        is_interactive = utilization_type =~ "Interactive",
+        billable = not(release_type =~ "Preview"),
+        rejected = status contains "reject",
+        delayed = coalesce(throttling_delay_ms, 0) > 0,
+        sku_cu = CapacitySkuCU(capacity_sku),
+        capacity_label = iff(isnotempty(capacity_friendly_name), capacity_friendly_name, capacity_name)
+    | extend default_len = iff(is_interactive, ia_len, bg_len)
+    // Fabric's own window is used when it looks sane, otherwise the type rule
+    | extend window_ok = use_window and isnotnull(window_start_time) and isnotnull(window_end_time)
+        and window_end_time > window_start_time and window_end_time - window_start_time <= 25h
+        and abs(window_start_time - event_time) <= 2h
+    | extend
+        win_start = iff(window_ok, window_start_time, event_time),
+        win_end = iff(window_ok, window_end_time, event_time + default_len)
+    | project-away dedup_key, default_len, window_ok
+}
+
+// ---------------------------------------------------------------------------
+// The engine: one row per capacity per minute between from_time and to_time.
+// Minutes after "now" are a projection: the load already booked if nothing
+// new runs. Reports should use the functions below instead of this one.
+//
+// booked_*: average CU already booked for the next N minutes by operations
+// known at that minute. Built with difference arrays: each operation adds its
+// rate over its window, and its booked share falls in a straight line over
+// the last N minutes of the window.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Per-minute smoothed utilization, carry-forward and Fabric throttling measures per capacity (minutes after now are projected)")
+CapacityMinuteAll(from_time: datetime, to_time: datetime) {
+    let s = CapacityWatchSettings();
+    let h1 = toint(s.delay_horizon_min);
+    let h2 = toint(s.interactive_reject_horizon_min);
+    let h3 = toint(s.background_reject_horizon_min);
+    let now_m = bin(now(), 1m) - toint(s.eval_lag_min) * 1m;
+    let start_m = bin(from_time, 1m);
+    let end_m = bin(to_time, 1m);
+    let scan_from = start_m - toint(s.warmup_days) * 1d - toint(s.background_window_min) * 1m - 1h;
+    let rej_lookback = toint(s.rejection_lookback_min);
+    let ops = materialize(CapacityOps(scan_from, now_m + 1m));
+    // A pause and resume gives the capacity a new activation_id. Fabric bills the
+    // smoothed usage still ahead at the pause, so it stops counting from then on.
+    let acts = materialize(ops
+        | where isnotempty(activation_id)
+        | summarize act_start = min(ts) by capacity_id, activation_id
+        | order by capacity_id asc, act_start asc
+        | extend
+            next_act = iff(next(capacity_id) == capacity_id, next(act_start), datetime(null)),
+            is_restart = prev(capacity_id) == capacity_id);
+    let spread = materialize(ops
+        | where billable and cu_s > 0
+        | join kind=leftouter (acts | project capacity_id, activation_id, next_act) on capacity_id, activation_id
+        | extend m0 = bin(win_start, 1m), minutes = max_of(1, toint(round((win_end - win_start) / 1m)))
+        | extend m1 = m0 + minutes * 1m
+        | extend m1 = iff(isnotnull(next_act) and bin(next_act, 1m) < m1, max_of(m0, bin(next_act, 1m)), m1)
+        // a window that opened before the scan starts counts from the first scanned minute
+        | extend rate = cu_s / (minutes * 60.0), m0 = max_of(m0, bin(scan_from, 1m))
+        | extend len = toint((m1 - m0) / 1m)
+        | where len > 0
+        | project capacity_id, m0, m1, len, rate, is_interactive);
+    let changes = union
+        (spread | project capacity_id, m = m0,
+            d_bg = iff(is_interactive, 0.0, rate), d_ia = iff(is_interactive, rate, 0.0),
+            b1 = rate * min_of(h1, len - 1) / h1, b2 = rate * min_of(h2, len - 1) / h2, b3 = rate * min_of(h3, len - 1) / h3),
+        (spread | project capacity_id, m = m1,
+            d_bg = iff(is_interactive, 0.0, -rate), d_ia = iff(is_interactive, -rate, 0.0),
+            sl1 = rate / h1, sl2 = rate / h2, sl3 = rate / h3),
+        (spread | project capacity_id, m = max_of(m0 + 1m, m1 - h1 * 1m), sl1 = -rate / h1),
+        (spread | project capacity_id, m = max_of(m0 + 1m, m1 - h2 * 1m), sl2 = -rate / h2),
+        (spread | project capacity_id, m = max_of(m0 + 1m, m1 - h3 * 1m), sl3 = -rate / h3),
+        (ops | summarize sku_cu = max(sku_cu), rej = countif(rejected), dly = countif(delayed),
+             nb_cu_s = sumif(cu_s, not(billable)) by capacity_id, m = bin(ts, 1m)),
+        (acts | where is_restart | project capacity_id, m = bin(act_start, 1m), restart = 1);
+    let names = ops
+        | summarize arg_max(ts, capacity_name, capacity_label, capacity_sku) by capacity_id
+        | project capacity_id, capacity_name, capacity_label, current_sku = capacity_sku;
+    let cumsum = dynamic([1.0, -1.0]);
+    changes
+    | where m >= bin(scan_from, 1m)
+    | make-series d_bg = sum(d_bg) default = 0.0, d_ia = sum(d_ia) default = 0.0,
+        b1 = sum(b1) default = 0.0, b2 = sum(b2) default = 0.0, b3 = sum(b3) default = 0.0,
+        sl1 = sum(sl1) default = 0.0, sl2 = sum(sl2) default = 0.0, sl3 = sum(sl3) default = 0.0,
+        sku_cu = max(sku_cu) default = 0.0, rej = sum(rej) default = 0, dly = sum(dly) default = 0,
+        nb_cu_s = sum(nb_cu_s) default = 0.0, restart = max(restart) default = 0
+        on m from bin(scan_from, 1m) to end_m + 1m step 1m by capacity_id
+    | extend
+        cu_bg = series_iir(d_bg, dynamic([1.0]), cumsum),
+        cu_ia = series_iir(d_ia, dynamic([1.0]), cumsum),
+        booked1 = series_iir(series_add(b1, series_iir(sl1, dynamic([1.0]), cumsum)), dynamic([1.0]), cumsum),
+        booked2 = series_iir(series_add(b2, series_iir(sl2, dynamic([1.0]), cumsum)), dynamic([1.0]), cumsum),
+        booked3 = series_iir(series_add(b3, series_iir(sl3, dynamic([1.0]), cumsum)), dynamic([1.0]), cumsum),
+        sku_cu = series_fill_backward(series_fill_forward(sku_cu, 0.0), 0.0),
+        rej_recent = series_fir(rej, repeat(1, rej_lookback), false, false)
+    // drop arrays that are not expanded, or every row would carry them
+    | project-away d_bg, d_ia, b1, b2, b3, sl1, sl2, sl3
+    | mv-expand m to typeof(datetime), cu_bg to typeof(real), cu_ia to typeof(real),
+        booked1 to typeof(real), booked2 to typeof(real), booked3 to typeof(real), sku_cu to typeof(real),
+        rej to typeof(long), dly to typeof(long), nb_cu_s to typeof(real), restart to typeof(long),
+        rej_recent to typeof(long)
+    | extend
+        is_projection = m > now_m,
+        cu_bg = max_of(cu_bg, 0.0),
+        cu_ia = max_of(cu_ia, 0.0),
+        booked1 = max_of(booked1, 0.0),
+        booked2 = max_of(booked2, 0.0),
+        booked3 = max_of(booked3, 0.0)
+    | extend util = iff(sku_cu > 0, (cu_bg + cu_ia) / sku_cu, real(null))
+    | partition hint.strategy = native by capacity_id (
+        order by m asc
+        | scan declare (carry_min: real = 0.0, over_streak_min: long = 0) with (
+            step s1: true =>
+                carry_min = iff(restart > 0, 0.0, max_of(0.0, s1.carry_min + coalesce(util, 0.0) - 1.0)),
+                over_streak_min = iff(coalesce(util, 0.0) > 1.0, s1.over_streak_min + 1, 0);
+        )
+    )
+    | where m >= start_m and m <= end_m
+    | extend
+        delay_pct = iff(sku_cu > 0, 100.0 * (booked1 / sku_cu + carry_min / h1), real(null)),
+        interactive_reject_pct = iff(sku_cu > 0, 100.0 * (booked2 / sku_cu + carry_min / h2), real(null)),
+        background_reject_pct = iff(sku_cu > 0, 100.0 * (booked3 / sku_cu + carry_min / h3), real(null))
+    | extend throttle_stage = case(
+        background_reject_pct > 100, "Background rejection",
+        interactive_reject_pct > 100, "Interactive rejection",
+        delay_pct > 100, "Interactive delay",
+        "None")
+    | lookup kind = leftouter names on capacity_id
+    | project
+        capacity_id, capacity_name, capacity_label, current_sku,
+        ts = m,
+        ts_local = datetime_utc_to_local(m, tostring(s.time_zone)),
+        is_projection,
+        sku_cu,
+        cu_background = round(cu_bg, 4),
+        cu_interactive = round(cu_ia, 4),
+        utilization_pct = round(100.0 * util, 2),
+        background_pct = round(iff(sku_cu > 0, 100.0 * cu_bg / sku_cu, real(null)), 2),
+        interactive_pct = round(iff(sku_cu > 0, 100.0 * cu_ia / sku_cu, real(null)), 2),
+        carry_min = round(carry_min, 3),
+        delay_pct = round(delay_pct, 2),
+        interactive_reject_pct = round(interactive_reject_pct, 2),
+        background_reject_pct = round(background_reject_pct, 2),
+        throttle_stage,
+        over_streak_min,
+        rejected_ops = iff(is_projection, long(0), rej),
+        rejected_recent = iff(is_projection, long(0), rej_recent),
+        delayed_ops = iff(is_projection, long(0), dly),
+        non_billable_cu_s = round(nb_cu_s, 1),
+        restarted = restart > 0
+}
+
+// ---------------------------------------------------------------------------
+// Past minutes only.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "One row per capacity per minute over the lookback: utilization, carry-forward, throttling measures, rejections")
+CapacityMinute(lookback: timespan) {
+    CapacityMinuteAll(now() - lookback, now())
+    | where not(is_projection)
+}
+
+// ---------------------------------------------------------------------------
+// For charts: the past (actual) plus 24 hours of projection, in steps.
+// Each step keeps the worst minute so short spikes are not averaged away.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Utilization and throttling timeline per capacity: actual over the lookback, then what is already booked for the next 24 hours if nothing new runs")
+CapacityTimeline(lookback: timespan, step: timespan = 5m) {
+    let s = CapacityWatchSettings();
+    CapacityMinuteAll(now() - lookback, now() + 24h)
+    | summarize
+        utilization_pct = max(utilization_pct),
+        background_pct = max(background_pct),
+        interactive_pct = max(interactive_pct),
+        carry_min = max(carry_min),
+        delay_pct = max(delay_pct),
+        interactive_reject_pct = max(interactive_reject_pct),
+        background_reject_pct = max(background_reject_pct),
+        rejected_ops = sum(rejected_ops),
+        is_projection = min(toint(is_projection))
+        by capacity_id, capacity_name, capacity_label, ts = bin(ts, step)
+    | extend
+        ts_local = datetime_utc_to_local(ts, tostring(s.time_zone)),
+        actual_pct = iff(is_projection == 1, real(null), utilization_pct),
+        projected_pct = iff(is_projection == 1, utilization_pct, real(null)),
+        limit_pct = 100.0
+    | project-away is_projection
+    | order by capacity_name asc, ts asc
+}
+
+// ---------------------------------------------------------------------------
+// Every stretch above 100%, with how long it lasted and the worst throttling
+// stage Fabric reached. An episode runs until carry-forward is paid back.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Overage episodes from per-minute rows (internal, used by CapacityOverageEpisodes and CapacityStatus)")
+CapacityEpisodesOf(minutes: (capacity_id: string, capacity_name: string, capacity_label: string, ts: datetime, utilization_pct: real, carry_min: real, delay_pct: real, interactive_reject_pct: real, background_reject_pct: real, throttle_stage: string, rejected_ops: long, delayed_ops: long)) {
+    let s = CapacityWatchSettings();
+    minutes
+    | extend in_episode = utilization_pct > 100 or carry_min > 0
+    | order by capacity_id asc, ts asc
+    | extend same_cap = prev(capacity_id) == capacity_id
+    | extend starts = iff(in_episode and not(same_cap and coalesce(prev(in_episode), false)), 1, 0)
+    | extend episode = row_cumsum(starts, not(same_cap))
+    | where in_episode
+    | summarize
+        start_utc = min(ts),
+        end_utc = max(ts) + 1m,
+        over_100_min = countif(utilization_pct > 100),
+        delayed_min = countif(throttle_stage == "Interactive delay"),
+        rejecting_min = countif(throttle_stage in ("Interactive rejection", "Background rejection")),
+        peak_pct = max(utilization_pct),
+        max_carry_min = max(carry_min),
+        peak_delay_pct = max(delay_pct),
+        peak_interactive_reject_pct = max(interactive_reject_pct),
+        peak_background_reject_pct = max(background_reject_pct),
+        rejected_ops = sum(rejected_ops),
+        delayed_ops = sum(delayed_ops)
+        by capacity_id, capacity_name, capacity_label, episode
+    | extend
+        episode_min = datetime_diff("minute", end_utc, start_utc),
+        episode_kind = case(over_100_min < 10, "Blip", over_100_min < 30, "Short", over_100_min < 60, "Sustained",
+                            over_100_min < 1440, "Long", "Full day"),
+        throttle_stage = case(peak_background_reject_pct > 100, "Background rejection",
+                              peak_interactive_reject_pct > 100, "Interactive rejection",
+                              peak_delay_pct > 100, "Interactive delay", "None"),
+        still_open = end_utc >= bin(now(), 1m) - toint(s.eval_lag_min) * 1m
+    | extend
+        start_local = datetime_utc_to_local(start_utc, tostring(s.time_zone)),
+        end_local = datetime_utc_to_local(end_utc, tostring(s.time_zone))
+    | project capacity_id, capacity_name, capacity_label, start_utc, end_utc, start_local, end_local,
+        episode_min, over_100_min, episode_kind, throttle_stage, delayed_min, rejecting_min, peak_pct,
+        max_carry_min = round(max_carry_min, 2), peak_delay_pct, peak_interactive_reject_pct,
+        peak_background_reject_pct, rejected_ops, delayed_ops, still_open
+    | order by start_utc desc
+}
+
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Overage episodes: each stretch above 100% until carry-forward is paid back, with kind and the worst throttling stage")
+CapacityOverageEpisodes(lookback: timespan) {
+    CapacityEpisodesOf(CapacityMinute(lookback))
+}
+
+// ---------------------------------------------------------------------------
+// One row per capacity: where it is now, the worst of the last 24 hours, and
+// when throttling ends if nothing new runs.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Current state per capacity with 24 hour peaks, throttling, rejections and a one-line verdict")
+CapacityStatus() {
+    let s = CapacityWatchSettings();
+    let tz = tostring(s.time_zone);
+    // three days of minutes so an episode that began before the last 24 hours shows its real start,
+    // plus the next 24 hours to see when throttling ends if nothing new runs
+    let all = materialize(CapacityMinuteAll(now() - 3d, now() + 24h));
+    let m = all | where not(is_projection);
+    let first_minute = toscalar(m | summarize min(ts));
+    let day_start = bin(now(), 1m) - 24h;
+    let ends = all
+        | where is_projection and throttle_stage == "None"
+        | summarize throttling_ends_utc = min(ts) by capacity_id;
+    let last_episode = CapacityEpisodesOf(m)
+        | where end_utc > day_start
+        | summarize arg_max(start_utc, end_utc, episode_kind, over_100_min, peak_pct, max_carry_min, throttle_stage,
+                            delayed_min, rejecting_min, rejected_ops, still_open) by capacity_id
+        | project capacity_id, ep_start = start_utc, ep_end = end_utc, ep_over_100_min = over_100_min,
+                  ep_peak_pct = peak_pct, ep_max_carry_min = max_carry_min, ep_stage = throttle_stage,
+                  ep_rejected = rejected_ops, ep_open = still_open;
+    m
+    | where ts > day_start
+    | summarize
+        arg_max(ts, utilization_pct, carry_min, delay_pct, interactive_reject_pct, background_reject_pct, throttle_stage, sku_cu),
+        peak_pct_24h = max(utilization_pct),
+        minutes_over_100_24h = countif(utilization_pct > 100),
+        max_carry_min_24h = max(carry_min),
+        peak_delay_pct_24h = max(delay_pct),
+        peak_interactive_reject_pct_24h = max(interactive_reject_pct),
+        peak_background_reject_pct_24h = max(background_reject_pct),
+        delayed_min_24h = countif(throttle_stage == "Interactive delay"),
+        rejecting_min_24h = countif(throttle_stage in ("Interactive rejection", "Background rejection")),
+        rejected_ops_24h = sum(rejected_ops),
+        delayed_ops_24h = sum(delayed_ops),
+        restarts_24h = countif(restarted)
+        by capacity_id, capacity_name, capacity_label, current_sku
+    | lookup kind = leftouter last_episode on capacity_id
+    | lookup kind = leftouter ends on capacity_id
+    | extend worst_stage_24h = case(
+        peak_background_reject_pct_24h > 100, "Background rejection",
+        peak_interactive_reject_pct_24h > 100, "Interactive rejection",
+        peak_delay_pct_24h > 100, "Interactive delay",
+        "None")
+    | extend state = case(
+        throttle_stage != "None", "Throttling now",
+        worst_stage_24h != "None" or rejected_ops_24h > 0, "Throttled in the last 24 hours",
+        peak_pct_24h > 100, "Spikes, no throttling",
+        "Healthy")
+    | extend fmt_start = strcat(iff(ep_start <= first_minute, "before ", ""),
+        format_datetime(datetime_utc_to_local(ep_start, tz), "yyyy-MM-dd HH:mm"))
+    | extend fmt_carry = iff(ep_max_carry_min >= 120, strcat(round(ep_max_carry_min / 60.0, 1), " h"),
+        strcat(tolong(round(ep_max_carry_min)), " min"))
+    | extend verdict = case(
+        isnull(ep_start), "Never over 100% in the last 24 hours.",
+        ep_stage == "None" and ep_open, strcat("Over 100% right now, for ", ep_over_100_min, " min so far (peak ",
+            tolong(round(ep_peak_pct)), "%). Fabric is not delaying anything yet: its 10-minute measure is at ",
+            tolong(round(delay_pct)), "%."),
+        ep_stage == "None", strcat("Short spike, not a capacity hit: over 100% for ", ep_over_100_min, " min from ",
+            fmt_start, " (peak ", tolong(round(ep_peak_pct)), "%). Fabric did not delay or reject anything."),
+        throttle_stage != "None", strcat("Throttling now: ", tolower(throttle_stage), ". Over 100% since ", fmt_start,
+            ", carry-forward peaked at ", fmt_carry,
+            iff(ep_rejected > 0, strcat(", ", ep_rejected, " rejected operations so far"), ""),
+            iff(isnotnull(throttling_ends_utc), strcat(". If nothing new runs it ends around ",
+                format_datetime(datetime_utc_to_local(throttling_ends_utc, tz), "yyyy-MM-dd HH:mm")), ""), "."),
+        strcat(iff(ep_open, "Paying back an overload, no throttling now. ", strcat("Recovered at ",
+            format_datetime(datetime_utc_to_local(ep_end, tz), "yyyy-MM-dd HH:mm"), ". ")),
+            "The overload started ", fmt_start, " and reached ", tolower(ep_stage),
+            "; carry-forward peaked at ", fmt_carry,
+            iff(ep_rejected > 0, strcat(", with ", ep_rejected, " rejected operations"), ""), "."))
+    | extend verdict = iff(restarts_24h > 0, strcat(verdict,
+        " The capacity was paused and resumed in the last 24 hours, which bills the usage still booked and starts again from zero."), verdict)
+    | project
+        capacity_id, capacity_name, capacity_label, sku = current_sku, as_of_utc = ts,
+        as_of_local = datetime_utc_to_local(ts, tz),
+        state, verdict, throttle_stage_now = throttle_stage, worst_stage_24h,
+        utilization_pct, carry_min, delay_pct, interactive_reject_pct, background_reject_pct,
+        throttling_ends_local = iff(throttle_stage != "None", datetime_utc_to_local(throttling_ends_utc, tz), datetime(null)),
+        peak_pct_24h, minutes_over_100_24h, max_carry_min_24h, peak_delay_pct_24h, peak_interactive_reject_pct_24h,
+        peak_background_reject_pct_24h, delayed_min_24h, rejecting_min_24h, rejected_ops_24h, delayed_ops_24h, restarts_24h,
+        state_rank = case(state == "Throttling now", 4, state == "Throttled in the last 24 hours", 3,
+                          state == "Spikes, no throttling", 2, 1)
+    | order by state_rank desc, capacity_name asc
+}
+
+// ---------------------------------------------------------------------------
+// The capacities in the stream.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "One row per capacity seen in the stream, with current SKU and last event")
+CapacityList() {
+    CapacityOperations
+    | where event_time > ago(30d) and isnotempty(capacity_id)
+    | summarize arg_max(event_time, capacity_name, capacity_friendly_name, capacity_sku),
+        first_seen_utc = min(event_time), events_24h = countif(event_time > ago(24h)) by capacity_id
+    | project capacity_id, capacity_name,
+        capacity_label = iff(isnotempty(capacity_friendly_name), capacity_friendly_name, capacity_name),
+        sku = capacity_sku, sku_cu = CapacitySkuCU(capacity_sku),
+        first_seen_utc, last_event_utc = event_time, events_24h
+    | order by capacity_name asc
+}
+
+// ---------------------------------------------------------------------------
+// Who uses the capacity: CU-seconds per day by workspace, against the SKU day.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "CU-seconds per local day by capacity and workspace, with the share of the SKU day")
+CapacityDailyUsage(lookback: timespan) {
+    let s = CapacityWatchSettings();
+    let tz = tostring(s.time_zone);
+    let ops = materialize(CapacityOps(now() - lookback, now())
+        | extend day = startofday(datetime_utc_to_local(ts, tz)));
+    let day_sku = ops | summarize day_sku_cu = max(sku_cu) by capacity_id, day;
+    ops
+    | summarize
+        cu_s = sumif(cu_s, billable),
+        non_billable_cu_s = sumif(cu_s, not(billable)),
+        operations = count(),
+        rejected_ops = countif(rejected)
+        by capacity_id, capacity_name, capacity_label, day,
+           workspace_name = iff(isempty(workspace_name), "(Fabric, no workspace)", workspace_name)
+    | lookup kind = leftouter day_sku on capacity_id, day
+    | extend share_of_sku_day_pct = round(100.0 * cu_s / (day_sku_cu * 86400.0), 2)
+    | project capacity_id, capacity_name, capacity_label, day, workspace_name, cu_s = round(cu_s, 1),
+        share_of_sku_day_pct, non_billable_cu_s = round(non_billable_cu_s, 1), operations, rejected_ops,
+        sku_cu = day_sku_cu
+    | order by day desc, cu_s desc
+}
+
+// ---------------------------------------------------------------------------
+// Which items changed: CU-seconds in the last N hours against the N before.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Items by CU-seconds in the last N hours against the N hours before")
+CapacityTopItems(hours: int = 24) {
+    let span = hours * 1h;
+    CapacityOps(now() - 2 * span, now())
+    | where billable
+    | extend period = iff(ts >= now() - span, "current", "previous")
+    | summarize
+        cu_s = sumif(cu_s, period == "current"),
+        prev_cu_s = sumif(cu_s, period == "previous"),
+        operations = countif(period == "current"),
+        rejected_ops = countif(period == "current" and rejected),
+        sku_cu = max(sku_cu)
+        by capacity_id, capacity_name, capacity_label,
+           workspace_name = iff(isempty(workspace_name), "(Fabric, no workspace)", workspace_name),
+           item_name = iff(isempty(item_name), "(none)", item_name), item_kind, operation_name, utilization_type
+    | extend
+        change_cu_s = cu_s - prev_cu_s,
+        share_of_sku_pct = round(100.0 * cu_s / (sku_cu * 3600.0 * hours), 2)
+    | project capacity_id, capacity_name, capacity_label, workspace_name, item_name, item_kind, operation_name,
+        utilization_type, cu_s = round(cu_s, 1), prev_cu_s = round(prev_cu_s, 1), change_cu_s = round(change_cu_s, 1),
+        share_of_sku_pct, operations, rejected_ops
+    | order by cu_s desc
+}
+
+// ---------------------------------------------------------------------------
+// Alert level per capacity per minute.
+//   critical: Fabric rejects work (60 minute or 24 hour measure over 100%),
+//             or any rejected operation in the last 15 minutes
+//   warning:  Fabric delays interactive work (10 minute measure over 100%),
+//             or over 100% for 10 minutes in a row
+//   ok:       anything else, including short spikes
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Alert level (ok, warning, critical) per capacity per minute with the reason")
+CapacityAlertLevels(hours: int = 24) {
+    let s = CapacityWatchSettings();
+    let streak_at = toint(s.warning_over_streak_min);
+    let rej_lookback = toint(s.rejection_lookback_min);
+    CapacityMinute(hours * 1h)
+    | extend alert_level = case(
+        throttle_stage in ("Interactive rejection", "Background rejection") or rejected_recent > 0, "critical",
+        throttle_stage == "Interactive delay" or (streak_at > 0 and over_streak_min >= streak_at), "warning",
+        "ok")
+    | extend reason = case(
+        throttle_stage == "Background rejection", strcat("Fabric rejects all new work, including scheduled jobs (24-hour measure at ",
+            tolong(round(background_reject_pct)), "%)"),
+        throttle_stage == "Interactive rejection", strcat("Fabric rejects new interactive work such as report queries (60-minute measure at ",
+            tolong(round(interactive_reject_pct)), "%)"),
+        rejected_recent > 0, strcat(rejected_recent, " operations rejected in the last ", rej_lookback, " min"),
+        throttle_stage == "Interactive delay", strcat("Fabric delays new interactive work by 20 seconds (10-minute measure at ",
+            tolong(round(delay_pct)), "%)"),
+        streak_at > 0 and over_streak_min >= streak_at, strcat("over 100% for ", over_streak_min, " min in a row (",
+            tolong(round(utilization_pct)), "% now), not throttled yet"),
+        strcat("back to normal: ", tolong(round(utilization_pct)), "% of the SKU"))
+    | project capacity_id, capacity_name, capacity_label, ts, ts_local, alert_level, reason,
+        utilization_pct, carry_min, delay_pct, interactive_reject_pct, background_reject_pct, over_streak_min, rejected_recent
+}
+
+// ---------------------------------------------------------------------------
+// Current alert level per capacity (health check, and a way to test delivery).
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Latest alert level per capacity")
+CapacityAlerts() {
+    CapacityAlertLevels(6)
+    | summarize arg_max(ts, *) by capacity_id
+    | project capacity_id, capacity_name, capacity_label, as_of = ts, as_of_local = ts_local, alert_level, reason,
+        utilization_pct, carry_min, delay_pct, interactive_reject_pct, background_reject_pct, over_streak_min, rejected_recent
+    | order by capacity_name asc
+}
+
+// ---------------------------------------------------------------------------
+// Every change of alert level (up, down or back to ok) in the last N hours.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Alert level changes per capacity in the last N hours")
+CapacityAlertHistory(hours: int = 24) {
+    CapacityAlertLevels(hours)
+    | order by capacity_id asc, ts asc
+    | extend previous_level = iff(prev(capacity_id) == capacity_id, prev(alert_level), "")
+    | where isnotempty(previous_level) and alert_level != previous_level
+    | project capacity_id, capacity_name, capacity_label, as_of = ts, as_of_local = ts_local,
+        previous_level, alert_level, reason, utilization_pct, carry_min, delay_pct, interactive_reject_pct,
+        background_reject_pct, over_streak_min, rejected_recent
+    | order by as_of desc
+}
+
+// ---------------------------------------------------------------------------
+// What Activator runs every 5 minutes: a row only when a capacity's level
+// changed in the last alert_window_min minutes.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Rows only for alert level changes in the last alert window; schedule Activator at the same interval")
+CapacityAlertChanges() {
+    let s = CapacityWatchSettings();
+    let window_end = bin(now(), 1m) - toint(s.eval_lag_min) * 1m;
+    let window_start = window_end - toint(s.alert_window_min) * 1m;
+    CapacityAlertHistory(6)
+    | where as_of > window_start and as_of <= window_end
+}
+
+// ---------------------------------------------------------------------------
+// Which operations Fabric rejected or delayed, by item.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Rejected and delayed operations by item in the last N hours")
+CapacityThrottledOps(hours: int = 24) {
+    let s = CapacityWatchSettings();
+    let tz = tostring(s.time_zone);
+    CapacityOps(now() - hours * 1h, now())
+    | where rejected or delayed
+    | summarize
+        rejected_ops = countif(rejected),
+        delayed_ops = countif(delayed),
+        total_delay_s = round(sum(coalesce(throttling_delay_ms, 0)) / 1000.0, 1),
+        users = dcount(identity_value),
+        first_utc = min(ts),
+        last_utc = max(ts)
+        by capacity_id, capacity_name, capacity_label,
+           workspace_name = iff(isempty(workspace_name), "(Fabric, no workspace)", workspace_name),
+           item_name = iff(isempty(item_name), "(none)", item_name), item_kind, operation_name, utilization_type
+    | extend first_local = datetime_utc_to_local(first_utc, tz), last_local = datetime_utc_to_local(last_utc, tz)
+    | order by rejected_ops desc, delayed_ops desc
+}
+
+// ---------------------------------------------------------------------------
+// Is the stream healthy? One row per event type.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Health check for the event stream and the update policies, one row per event type")
+CapacityWatchHealth() {
+    let types = datatable(event_type: string, target_table: string, required: bool) [
+        "Microsoft.Fabric.CapacityOperationEvents.Operation", "CapacityOperations", true,
+        "Microsoft.Fabric.Capacity.Summary", "CapacitySummary", false,
+        "Microsoft.Fabric.Capacity.State", "CapacityStateChanges", false
+    ];
+    let raw = CapacityEventsRaw
+        | where ['time'] > ago(1d)
+        | summarize raw_rows_last_hour = countif(['time'] > ago(1h)), raw_rows_last_day = count(),
+            newest_event_utc = max(['time']), newest_ingestion_utc = max(ingestion_time()),
+            capacities = dcount(tostring(data.capacityId))
+            by event_type = ['type'];
+    let typed = union
+        (CapacityOperations | where event_time > ago(1d) | summarize typed_rows_last_day = count()
+            | extend event_type = "Microsoft.Fabric.CapacityOperationEvents.Operation"),
+        (CapacitySummary | where event_time > ago(1d) | summarize typed_rows_last_day = count()
+            | extend event_type = "Microsoft.Fabric.Capacity.Summary"),
+        (CapacityStateChanges | where event_time > ago(1d) | summarize typed_rows_last_day = count()
+            | extend event_type = "Microsoft.Fabric.Capacity.State");
+    types
+    | join kind = leftouter raw on event_type
+    | join kind = leftouter typed on event_type
+    | extend raw_rows_last_day = coalesce(raw_rows_last_day, 0), typed_rows_last_day = coalesce(typed_rows_last_day, 0)
+    | extend minutes_since_newest = datetime_diff("minute", now(), newest_event_utc)
+    | extend status = case(
+        raw_rows_last_day == 0 and required, "Problem: no events in the last day. Check the Eventstream source and destination.",
+        raw_rows_last_day == 0, "Not streamed (optional)",
+        typed_rows_last_day < raw_rows_last_day, strcat("Problem: events reach CapacityEventsRaw but not ", target_table, ". Run kql/01-tables.kql again."),
+        minutes_since_newest > 60, "Quiet: no events in the last hour (normal if nothing ran on the capacity)",
+        "Receiving events")
+    | project event_type, target_table, status, raw_rows_last_hour = coalesce(raw_rows_last_hour, 0), raw_rows_last_day,
+        typed_rows_last_day, capacities = coalesce(capacities, 0), newest_event_utc, minutes_since_newest, newest_ingestion_utc
+}
+
+// ---------------------------------------------------------------------------
+// Optional: Fabric's own numbers from capacity overview events, per minute,
+// and how close the rebuilt numbers are. Empty without overview events.
+// ---------------------------------------------------------------------------
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Fabric's own utilization, throttling measures and carry-forward per capacity per minute (needs capacity overview events)")
+CapacityFabricMinutes(lookback: timespan) {
+    CapacitySummary
+    | where window_start_time > now() - lookback and base_capacity_units > 0
+    | summarize arg_max(event_time, *) by capacity_id, window_start_time
+    | summarize
+        fabric_utilization_pct = round(100.0 * sum(capacity_unit_ms) / sum(base_capacity_units * 30000.0), 2),
+        fabric_delay_pct = round(max(interactive_delay_pct), 2),
+        fabric_interactive_reject_pct = round(max(interactive_rejection_pct), 2),
+        fabric_background_reject_pct = round(max(background_rejection_pct), 2),
+        fabric_carry_min = round(max(overage_total_cu_ms / (base_capacity_units * 60000.0)), 3),
+        timepoints = count()
+        by capacity_id, capacity_name, ts = bin(window_start_time, 1m)
+    | extend fabric_stage = case(
+        fabric_background_reject_pct > 100, "Background rejection",
+        fabric_interactive_reject_pct > 100, "Interactive rejection",
+        fabric_delay_pct > 100, "Interactive delay",
+        "None")
+}
+
+.create-or-alter function with (folder = "CapacityWatch", docstring = "Rebuilt against Fabric's own numbers, per capacity per minute (needs capacity overview events)")
+CapacityFabricCompare(lookback: timespan) {
+    CapacityMinute(lookback)
+    | project capacity_id, capacity_label, ts, utilization_pct, delay_pct, interactive_reject_pct,
+        background_reject_pct, carry_min, throttle_stage
+    | join kind = inner (CapacityFabricMinutes(lookback)) on capacity_id, ts
+    | project capacity_id, capacity_name, capacity_label, ts, utilization_pct, fabric_utilization_pct,
+        delay_pct, fabric_delay_pct, interactive_reject_pct, fabric_interactive_reject_pct,
+        background_reject_pct, fabric_background_reject_pct, carry_min, fabric_carry_min,
+        throttle_stage, fabric_stage
+}
+
+.create-or-alter function with (folder = "CapacityWatch", docstring = "How close the rebuilt numbers are to Fabric's own, per capacity (needs capacity overview events)")
+CapacityFabricCheck(lookback: timespan = 1d) {
+    CapacityFabricCompare(lookback)
+    | summarize
+        minutes_compared = count(),
+        avg_utilization_pct = round(avg(utilization_pct), 1),
+        avg_fabric_utilization_pct = round(avg(fabric_utilization_pct), 1),
+        mean_abs_diff_utilization = round(avg(abs(utilization_pct - fabric_utilization_pct)), 2),
+        p95_abs_diff_utilization = round(percentile(abs(utilization_pct - fabric_utilization_pct), 95), 2),
+        mean_abs_diff_delay = round(avg(abs(delay_pct - fabric_delay_pct)), 2),
+        stage_agreement_pct = round(100.0 * countif(throttle_stage == fabric_stage) / count(), 1),
+        throttled_min = countif(throttle_stage != "None"),
+        fabric_throttled_min = countif(fabric_stage != "None")
+        by capacity_id, capacity_name, capacity_label
+}

@@ -1,0 +1,4 @@
+// Parameter "Capacity": single selection, variable name _capacity, data type string.
+// Source: this query. Value column: capacity_label. Default value: first value of the query.
+CapacityList()
+| project capacity_label

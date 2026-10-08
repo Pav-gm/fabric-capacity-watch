@@ -1,0 +1,18 @@
+// Tile: Capacity status
+// Visual: Table. Shows every capacity, so it does not use the parameter.
+// Conditional formatting on State: "Throttling now" red, "Throttled in the last 24 hours" orange,
+// "Spikes, no throttling" yellow, "Healthy" green.
+CapacityStatus()
+| project
+    Capacity = capacity_label,
+    SKU = sku,
+    State = state,
+    Verdict = verdict,
+    ['Now %'] = utilization_pct,
+    ['Peak 24h %'] = peak_pct_24h,
+    ['Carry-forward min'] = carry_min,
+    ['10-min measure %'] = delay_pct,
+    ['60-min measure %'] = interactive_reject_pct,
+    ['24-h measure %'] = background_reject_pct,
+    ['Rejected ops 24h'] = rejected_ops_24h,
+    ['As of'] = as_of_local
