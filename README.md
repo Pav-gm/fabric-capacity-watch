@@ -55,7 +55,7 @@ flowchart LR
 ## Quick start with Claude Code
 
 ```bash
-git clone <this repo>
+git clone https://github.com/Pav-gm/fabric-capacity-watch.git
 cd fabric-capacity-watch
 claude
 ```
